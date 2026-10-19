@@ -1,0 +1,174 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[margin=0.5in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\setlist{itemsep=2pt,topsep=3pt}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\renewcommand{\arraystretch}{1.15}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Baseline Retrieval vs.\ Cross-Encoder Re-Ranking\\[2pt]\large A RAG comparison on the ICC Playing Handbook 2019--20}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+\vspace{-3em}
+
+\section*{Setup}
+
+\textbf{Document}
+\begin{itemize}
+\item ICC Playing Handbook 2019--20 (cricket rules), 427 PDF pages.
+\item About 297,000 words after cleaning, split into 2,660 chunks of at most 150 words.
+\item The format name (for example ``ICC Men's One Day International Playing Conditions'') is written at the start of each chunk.
+\end{itemize}
+
+\textbf{Models}
+\begin{itemize}
+\item Bi-encoder: \code{all-MiniLM-L6-v2} (384-dimensional vectors, FAISS flat index).
+\item Cross-encoder: \code{ms-marco-MiniLM-L-6-v2}.
+\item LLM: \code{llama3.1:8b} through Ollama, temperature 0.
+\end{itemize}
+
+\textbf{Pipelines}
+\begin{itemize}
+\item \textbf{Pipeline 1 (baseline):} bi-encoder top 10, then the top 3 go to the LLM $\rightarrow$ Answer 1.
+\item \textbf{Pipeline 2 (re-ranked):} the same top 10 are re-scored by the cross-encoder, sorted, and the top 3 go to the LLM $\rightarrow$ Answer 2.
+\item The prompt is identical in both pipelines.
+\end{itemize}
+
+\textbf{Machine}
+\begin{itemize}
+\item MacBook Air M4, 24 GB memory; everything runs locally.
+\end{itemize}
+
+\section{Architecture: bi-encoder vs.\ cross-encoder}
+
+\subsection*{Bi-encoder}
+\textbf{How it works}
+\begin{itemize}
+\item The same transformer reads the query and each chunk \emph{separately}.
+\item Each text becomes one vector of 384 numbers (the average of the token vectors, scaled to length 1).
+\item The score is the dot product of the two vectors, which equals the cosine similarity.
+\end{itemize}
+\textbf{Speed}
+\begin{itemize}
+\item Chunk vectors are computed once and stored.
+\item A search needs one pass for the query, then fast dot products.
+\end{itemize}
+\textbf{Limits}
+\begin{itemize}
+\item A chunk is squeezed into 384 numbers \emph{before the question is known}, so small details (20 vs.\ 50, ``not'') can be blurred.
+\item Input limit: 256 tokens.
+\end{itemize}
+\newpage
+\subsection*{Cross-encoder}
+\textbf{How it works}
+\begin{itemize}
+\item The query and one chunk are joined into \emph{one input}: \code{[CLS] query [SEP] chunk [SEP]}.
+\item In every layer, self-attention lets each query token look at each chunk token and the other way round.
+\item The \code{[CLS]} output goes to a small layer that gives \emph{one relevance score} for the pair. It is not a cosine, so scores can only be compared within one query.
+\end{itemize}
+\textbf{Speed}
+\begin{itemize}
+\item Nothing can be computed in advance: each (query, chunk) pair needs a full pass.
+\end{itemize}
+\textbf{Limits}
+\begin{itemize}
+\item Input limit: 512 tokens for the pair.
+\item More accurate on details, but slower.
+\end{itemize}
+
+\subsection*{Side by side}
+\begin{center}\small
+\begin{tabular}{@{}l l l@{}}
+\toprule
+ & Bi-encoder & Cross-encoder \\
+\midrule
+Input & Query and chunk, separately & Query and chunk, together \\
+Output & One vector per text & One score per pair \\
+Score & Cosine (dot product) & Raw relevance score \\
+Chunk work done in advance & Yes (vectors stored) & No \\
+Cost per query & 1 pass + dot products & 1 pass per chunk \\
+Input limit & 256 tokens & 512 tokens (pair) \\
+Used here for & Top 10 from 2,660 chunks & Re-sorting those 10 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Rank shifts and answer comparison}
+
+Rank is the position of the right chunk in the top 10 (bi-encoder $\rightarrow$ cross-encoder). Chunk id and page are in brackets. ``Omitted'' means the LLM replied ``The provided excerpts do not contain the answer.''
+
+{\small\renewcommand{\arraystretch}{1.0}
+\begin{longtable}{@{}r >{\raggedright}p{1.8cm} >{\raggedright}p{4.2cm} >{\raggedright}p{3.0cm} >{\raggedright}p{2.0cm} >{\raggedright\arraybackslash}p{3.2cm}@{}}
+\toprule
+\# & Type & Query (short) & Right chunk, rank & Answer 1 & Answer 2 \\
+\midrule
+\endhead
+1 & Buried chunk & Overs per team, women's T20I & \#1626 (p9.26): $7\rightarrow1$ & Omitted & ``20 overs''. Correct \\
+2 & Buried chunk & Fielders outside the circle, overs 11--40, men's ODI & \#589 (p4.55): $6\rightarrow1$ & Omitted & ``Four''. Correct \\
+3 & Buried chunk & Overs per innings, men's ODI & \#473 (p4.24): $10\rightarrow2$ & Omitted & ``50 overs''. Correct \\
+4 & Exception & Dismissal on a free hit, men's T20I & \#924 (p5.43): $7\rightarrow1$ & Omitted & Only in the ways allowed for a No ball. Correct \\
+5 & Negation & Can a suspended bowler bowl again in the innings, men's ODI & \#646 (p4.73): $8\rightarrow1$ & Omitted & ``No, shall not be allowed to bowl again in that innings''. Correct \\
+6 & Keyword / synonym & ``Short balls at head height'' per over, men's T20I (rule says ``fast short-pitched delivery'') & \#1017 (p5.70): $7\rightarrow1$ & Omitted & Omitted (chunk found, LLM still refused) \\
+7 & Re-ranking hurts & Fielders outside the circle, first ten overs, men's ODI & \#588 (p4.55): $1\rightarrow8$ & ``Two''. Correct & Omitted \\
+8 & Re-ranking hurts & Bat straight after 8+ min off the field, men's T20I & \#937 (p5.47): $3\rightarrow10$ & ``No, not until\dots''. Correct & Omitted \\
+9 & Not in top 10 & Overs per bowler, men's T20I & \#862 (p5.26): not in top 10 & Omitted & Omitted \\
+10 & Not in top 10 & Runner for an injured batter, T20I & \#944 (p5.48): not in top 10 & Omitted & Omitted \\
+\bottomrule
+\end{longtable}}
+
+\newpage
+\textbf{What the results show.}
+\begin{itemize}
+\item \textbf{Why the baseline fails.} The five formats (men's Test, ODI, T20I, women's Championship, women's T20I) repeat most clauses with small changes, for example 50 or 20 overs. The baseline top 3 often held chunks from the wrong format or the wrong Powerplay phase. In query 2 it held the first-Powerplay ODI chunk (\#588), a T20I chunk (\#964) and a women's Championship chunk (\#1356), but not the right one.
+\item \textbf{The baseline omitted the clause; it did not make up a number.} The prompt tells the LLM to use only the excerpts, so a missed chunk became a refusal. In queries 1--5 this is the ``omits an essential clause'' case. No hallucination was seen in these 10 runs.
+\item \textbf{The cross-encoder fixed 6 of 10} (queries 1--6). It reads the question together with the format name in the chunk, so it can pick the right copy. In queries 1--5 this also gave a correct Answer 2.
+\item \textbf{It made 2 worse} (queries 7, 8): it ranked a chunk for another phase higher, and the right chunk left the top 3.
+\item \textbf{It cannot help when the chunk is not in the top 10} (queries 9, 10). The rule is one sentence inside a long chunk, or the question uses a word the document does not (for example ``bouncers''). The cross-encoder only re-sorts the top 10.
+\item \textbf{Query 6:} retrieval was fixed but the 8B LLM still refused, so not every failure is a retrieval failure.
+\end{itemize}
+
+\textbf{Limit of this test.} About 80 questions were tried and these 10 were kept. Most questions were already answered correctly by both pipelines. The results show \emph{when} re-ranking helps or hurts, not how often.
+
+\section{Latency profiling}
+
+Measured on a MacBook Air M4 (24 GB), 10 queries $\times$ 10 repeats, after a warm-up. Mean $\pm$ standard deviation, in milliseconds. The top 10 comes from an exact (flat) FAISS index over 2,660 chunks.
+
+\begin{center}\small
+\begin{tabular}{@{}l r r@{}}
+\toprule
+Stage & Pipeline 1 (ms) & Pipeline 2 (ms) \\
+\midrule
+Stage 1: embed query + FAISS top 10 & $5.0 \pm 1.0$ & $5.0 \pm 1.0$ \\
+Stage 2: cross-encoder on 10 pairs & not used & $35.9 \pm 3.3$ \\
+\textbf{Retrieval total} & $\mathbf{5.0 \pm 1.0}$ & $\mathbf{40.9 \pm 3.8}$ \\
+LLM answer (\code{llama3.1:8b}, top 3 chunks) & $1379 \pm 1173$ & $1700 \pm 1254$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Re-ranking adds about 36 ms, about 8 times the retrieval time. This is small next to the LLM. LLM time varies a lot because it depends on answer length (a one-line refusal takes about 0.5 s).
+
+\section{Why not run the cross-encoder on the whole collection?}
+
+\begin{enumerate}
+\item \textbf{Nothing can be precomputed.} A bi-encoder embeds each chunk once, before any query. A cross-encoder needs the query, so every (query, chunk) pair needs a new transformer pass for every query.
+\item \textbf{Cost grows with collection size.} Measured: 35.9 ms for 10 pairs, about 3.6 ms per pair. For our 2,660 chunks that is about 9.5 s per query. For 1 million chunks it would be about 1 hour per query. (This is an estimate from the measured time; a GPU would be faster, but the growth is the same.) The bi-encoder search over 2,660 chunks takes 5 ms, and large systems use approximate indexes that look at only a small part of the vectors.
+\item \textbf{So we use two stages.} The cheap bi-encoder picks a small candidate set (top 10); the expensive cross-encoder re-orders only those. The limit: a chunk the bi-encoder did not put in the top 10 can never be recovered (queries 9, 10). A larger top-$K$ helps, but cost grows with $K$.
+\end{enumerate}
+
+\end{document}
